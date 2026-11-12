@@ -98,6 +98,7 @@
 #include "game.h"
 #include "coop.h"
 #include "kbd.h"
+#include "fpv_camera.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -214,7 +215,7 @@ __attribute__((weak)) void gw_size(unsigned *w, unsigned *h){ *w = 0; *h = 0; }
 enum { PH_HELLO = 0, PH_OPEN = 1, PH_HOLD = 2, PH_MOVE = 3, PH_TURN = 4, PH_DRAG = 5, PH_PAN = 6, PH_DOLLY = 7,
        PH_FOV = 8, PH_ROLL = 9, PH_MODE = 10, PH_RESET = 11, PH_NAMES = 12, PH_FOCUS = 13, PH_BLUR = 14, PH_CARS = 15, PH_FREEZE = 16,
        PH_SPEED = 17, PH_SMOOTH = 18, PH_LEVEL = 19, PH_SPIN = 20, PH_PATH = 21, PH_SHOW = 22, PH_LIGHTS = 23, PH_HORNS = 24,
-       PH_WEATHER = 25, PH_TARGET = 26, PH_SHUTTER = 27, PH_SIZE = 28, PH_SHIFT = 29, PH_LENS = 30 };
+       PH_WEATHER = 25, PH_TARGET = 26, PH_SHUTTER = 27, PH_SIZE = 28, PH_SHIFT = 29, PH_LENS = 30, PH_FPV = 31, PH_FPV_STICKS = 32 };
 /* PH_PATH's: the camera's path */
 enum { PATH_CLEAR = 0, PATH_ADD = 1, PATH_PLAY = 2, PATH_STOP = 3 };
 /* PH_HOLD's bits: keys and buttons held */
@@ -239,6 +240,21 @@ static struct {
         .speed = NONE_SET, .smooth = NONE_SET, .level = -1, .spin = NONE_SET, .path = -1,
         .show = -1, .lights = -1, .horns = -1, .weather = NONE_SET, .target = -1,
         .shutter = -1, .size = -1, .shift_x = NONE_SET, .shift_y = NONE_SET, .lens = -1 };
+
+/* Valid inputs use four signed bytes in [-127, 127]. */
+#define FPV_NO_SAMPLE 0x80808080u
+enum { FPV_CAN_OPEN = 1024, FPV_ACTIVE = 2048 };
+static atomic_int fpv_request;
+static atomic_int fpv_enabled;
+static atomic_int fpv_clear;
+static atomic_uint fpv_sample = FPV_NO_SAMPLE;
+static struct {
+    fpv_flight flight;
+    fpv_controls controls;
+    int active, armed;
+    double sampled;
+    float yaw, roll;
+} F;
 
 /* the page's events (runtime/web/input_web.c, IEV_PHOTO) and the test script's */
 void photo_input(int cmd, int a, int b){
@@ -274,6 +290,14 @@ void photo_input(int cmd, int a, int b){
     case PH_SIZE:  atomic_store(&I.size, a); break;                               /* the picture: 1 the screen's, 2 .. 4 times */
     case PH_SHIFT: atomic_store(&I.shift_x, a); atomic_store(&I.shift_y, b); break; /* lens shift, 1/1000 of the view's half */
     case PH_LENS:  atomic_store(&I.lens, a); break;                               /* 0 normal, 1 fisheye */
+    case PH_FPV:
+        if (a == 2) atomic_store(&fpv_enabled, 1);
+        else if (atomic_load(&fpv_enabled)) atomic_store(&fpv_request, a ? 1 : 2);
+        break;
+    case PH_FPV_STICKS:
+        if ((uint32_t)a == FPV_NO_SAMPLE) atomic_store(&fpv_clear, 1);
+        else atomic_store(&fpv_sample, (uint32_t)a);
+        break;
     default: break;
     }
 }
@@ -1068,12 +1092,78 @@ static void picture(void){
 }
 
 /* the camera mover's: the eye and the point, nothing of its own */
-static void place(uint32_t pl){
+static void place(uint32_t pl, const float eye[3], const float look[3]){
     uint32_t m = guest_rd32(pl + PL_MOVER);
     memset(g_mem + m + MV_KEYS, 0, 20);
     MR32(G_FOLLOW) = 0xffffffffu;
     MR32(G_NUDGE) = 0; MR32(G_NUDGE + 4u) = 0; MR32(G_NUDGE + 8u) = 0;
-    wr3(G_EYE, P.se); wr3(G_LOOK, P.sl);
+    wr3(G_EYE, eye); wr3(G_LOOK, look);
+}
+
+static int fpv_frame(CPU *c, double now, float dt){
+    if (!atomic_load(&fpv_enabled)) return 0;
+    int request = atomic_exchange(&fpv_request, 0);
+    uint32_t pl = player(), car = car_of(pl);
+    int eligible = !P.on && !coop_in() && MR32(G_RACETYPE) == 0u && !not_now(F.active);
+    if (F.active && (!eligible || request == 2)){
+        if (MR32(G_FLOW) == 6u && pl && mover_type(pl) == MOVER_DEBUG){
+            uint32_t z = 0;
+            gcall_main(c, FN_OWN_CAMERA, pl, 1, &z);
+        }
+        F.active = 0;
+        F.armed = 0;
+        atomic_store(&fpv_clear, 0);
+        atomic_store(&fpv_sample, FPV_NO_SAMPLE);
+        fprintf(stderr, "[fpv] camera off\n");
+        eligible = 0;
+    }
+    int parked = eligible && guest_ok(car, CAR_SPEED + 3u) && fabsf(MRF32(car + CAR_SPEED)) <= 0.5f;
+    if (!F.active && request == 1 && parked){
+        float eye[3], forward[3] = { 1.f, 0.f, 0.f };
+        centre(car, eye);
+        uint32_t cam = view1_camera(), arg[2] = { MOVER_DEBUG, 0u };
+        if (cam) rd3(cam + CAM_FWD, forward);
+        F.yaw = hypotf(forward[0], forward[1]) > 0.001f ? atan2f(forward[1], forward[0]) : 0.f;
+        gcall_main(c, FN_SET_MOVER, pl, 2, arg);
+        if (mover_type(pl) == MOVER_DEBUG){
+            fpv_acro_reset(&F.flight, eye, F.yaw);
+            fpv_acro_set_mass(&F.flight, 750.f);
+            F.active = 1;
+            F.armed = 0;
+            F.sampled = now;
+            F.controls = (fpv_controls){ .lift = -1.f };
+            atomic_store(&fpv_clear, 0);
+            atomic_store(&fpv_sample, FPV_NO_SAMPLE);
+            fprintf(stderr, "[fpv] camera on\n");
+        }
+    }
+    if (F.active){
+        uint32_t sample = atomic_exchange(&fpv_sample, FPV_NO_SAMPLE);
+        if (atomic_exchange(&fpv_clear, 0) || (sample == FPV_NO_SAMPLE && now - F.sampled > 0.25)){
+            F.armed = 0;
+            F.controls = (fpv_controls){ .lift = -1.f };
+        } else if (sample != FPV_NO_SAMPLE){
+            float axis[4];
+            for (unsigned i = 0; i < 4; ++i)
+                axis[i] = (float)(int8_t)(sample >> (8u * i)) / 127.f;
+            F.controls = (fpv_controls){ axis[0], -axis[1], -axis[2], axis[3] };
+            if (F.controls.lift < -0.95f) F.armed = 1;
+            F.sampled = now;
+        }
+        float anchor[3], look[3];
+        centre(car, anchor);
+        if (F.armed) fpv_acro_step(&F.flight, &F.controls, dt);
+        else {
+            /* With no pilot, keep the camera still and cut the motors. */
+            memset(F.flight.v, 0, sizeof F.flight.v);
+            memset(F.flight.omega, 0, sizeof F.flight.omega);
+            F.flight.motor = 0.f;
+        }
+        fpv_camera_limit(&F.flight, anchor);
+        F.roll = fpv_camera_view(&F.flight, look, &F.yaw);
+        place(pl, F.flight.p, look);
+    }
+    return (parked ? FPV_CAN_OPEN : 0) | (F.active ? FPV_ACTIVE : 0);
 }
 
 /* the pause menu's label, in the game's language (the Latin-script ones as their language files write theirs, in
@@ -1094,12 +1184,12 @@ static void label(void){
 }
 
 /* the status, when it changes */
-static void publish(int can){
+static void publish(int can, int fpv){
     static const char *const k[NSLOTS] = { "photo", "photo_fov", "photo_roll", "photo_n", "photo_focus", "photo_path", "photo_target" };
     if (!P.slots){ P.slots = 1; for (int i = 0; i < NSLOTS; i++){ P.slot[i] = host_status_slot(k[i]); P.val[i] = -1; } }
     double v[NSLOTS] = { (double)((can && !P.on ? 1 : 0) | (P.on ? 2 : 0) | (P.on && P.free ? 4 : 0) | (P.names ? 8 : 0) |
                                   (P.on && roam_game_names_here() ? 16 : 0) | (P.focus_auto ? 32 : 0) |
-                                  (P.drive_on ? 0 : 256) | (P.on && roam_game_online_here() ? 512 : 0)),   /* (256: time stands) */
+                                  (P.drive_on ? 0 : 256) | (P.on && roam_game_online_here() ? 512 : 0) | fpv),   /* (256: time stands) */
                          floor(P.fov * 10.f + 0.5f) / 10.0, floor(P.roll * 10.f + 0.5f) / 10.0, (double)P.n,
                          floor(P.focus * 10.f + 0.5f) / 10.0, (double)(P.path_n | (P.path_play ? 16 : 0)),
                          (double)(P.on && P.target ? P.target_kind : KIND_MINE) };
@@ -1120,6 +1210,7 @@ void photo_frame(CPU *c){
     hud_frame();
     if (!P.shown_set){ P.shown_set = 1; P.show = SHOW_ALL; P.lights = 1; P.horns = 1; P.weather = -1; }
     label();
+    int fpv = fpv_frame(c, t, dt);
     int req = atomic_exchange(&I.open, 0);
     const char *why = not_now(P.on);
     if (P.on && (why || req == 2)) leave(c, req == 2 ? "closed" : why);
@@ -1193,10 +1284,10 @@ void photo_frame(CPU *c){
         }
         if (!P.lights) lights_off(mine);
         MR32(G_HEADLIGHTS) = P.show & SHOW_MINE ? P.hl_was : 0u;
-        steer(P.target ? P.target : mine, mine, dt); place(pl); picture();
+        steer(P.target ? P.target : mine, mine, dt); place(pl, P.se, P.sl); picture();
     }
     pic_publish();
-    publish(!why && atomic_load(&I.page));
+    publish(!why && atomic_load(&I.page), fpv);
 }
 
 /* overrides.c sub_005c7ec0: while photo mode is on, the view's field of view (a binary angle) and tilt (radians), and
@@ -1206,6 +1297,11 @@ void photo_frame(CPU *c){
  * it (the projection made that much bigger again, so what the shift brings in is drawn); j[8] tiles a side, j[9],
  * j[10] the tile drawn (from the left, from the top) */
 int photo_view(uint16_t *fov, float *roll, float *j){
+    if (F.active){
+        *fov = (uint16_t)lrintf(105.f * 65536.f / 360.f);
+        *roll = F.roll;
+        return 1;
+    }
     if (!P.on) return 0;
     float f = P.fov * (S.lens ? FISHEYE_WIDER : 1.f), sx = S.lens ? 0.f : S.shift[0], sy = S.lens ? 0.f : S.shift[1];
     float k = 1.f + fmaxf(fabsf(sx), fabsf(sy));

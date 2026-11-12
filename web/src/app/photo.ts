@@ -23,6 +23,7 @@
 // playing), photo_target (the kind of car the camera is on), photo_pic (the picture's options allowed now).
 // Freeze time off: the world runs on (traffic, racers, friends' cars), each frame is the picture, no Blur or Focus.
 import type { GameSession } from './game';
+import { FpvControls } from './fpv';
 import type { PadSnapshot } from '../input/gamepad';
 import { CROPS, FILTERS, cropRect, focusM, focusV, type Filter } from './photolook';
 import type { PhotoLook } from '../gpu/photo-picture';
@@ -138,6 +139,7 @@ export class PhotoMode {
   private hello = false;
   private can = false;
   private free = false;
+  private readonly fpv: FpvControls;
   private namesHere = false;             // friends' names can show (free roam with them)
   private playersHere = false;           // other players' cars can be here (free roam with them)
   /** whether photo mode is on (the game's status) */
@@ -257,6 +259,7 @@ export class PhotoMode {
     const f = this.flash = document.createElement('div');
     f.className = 'photo-flash'; f.hidden = true;          // (hidden by a timer: with reduced motion no animation ends)
     stage.append(p, f);
+    this.fpv = new FpvControls(stage, (cmd, value) => this.send(cmd, value), () => this.input()?.releaseAll?.());
     addEventListener('keydown', e => this.onKey(e as KeyboardEvent, true), { capture: true });
     addEventListener('keyup', e => this.onKey(e as KeyboardEvent, false), { capture: true });
     for (const type of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel'])
@@ -264,8 +267,8 @@ export class PhotoMode {
     addEventListener('wheel', e => this.onWheel(e as WheelEvent), { capture: true, passive: false });
     addEventListener('contextmenu', e => { if (this.mine(e)) { e.preventDefault(); e.stopImmediatePropagation(); } }, { capture: true });
     // no key-up comes for a key held while the page loses the keyboard (alt-tab, another tab)
-    addEventListener('blur', () => this.letGo());
-    document.addEventListener('visibilitychange', () => { if (document.hidden) this.letGo(); });
+    addEventListener('blur', () => { this.letGo(); this.fpv.clear(); });
+    document.addEventListener('visibilitychange', () => { if (document.hidden) { this.letGo(); this.fpv.clear(); } });
     this.setTab(k.tab, false);
   }
 
@@ -280,8 +283,11 @@ export class PhotoMode {
   stop() {
     cancelAnimationFrame(this.raf);
     this.show(false);
+    this.fpv.reset();
     this.session = null; this.can = false;
   }
+
+  toggleFpv() { return !pageDialog() && this.fpv.toggle(); }
 
   /** F12: the picture while photo mode is on; else photo mode where it can open, the screenshot where it cannot */
   f12() {
@@ -292,6 +298,7 @@ export class PhotoMode {
 
   /** the controller while no dialog of the page is open (gamepad.ts PadPage.capture): photo mode's while it is on */
   pad(s: PadSnapshot, pressed: number): boolean {
+    if (this.fpv.capture(s)) return true;
     if (!this.on) return false;
     const b = s.buttons, a = s.axes, on = (n: number) => (b & 1 << n) !== 0, inv = this.kept.invert ? -1 : 1;
     if (pressed & 1 << PAD_A) void this.shoot();
@@ -465,9 +472,11 @@ export class PhotoMode {
     const s = this.session;
     if (!s) return;
     if (!this.hello && this.send(PH_HELLO)) this.hello = true;
+    this.fpv.tick(document.hidden || !document.hasFocus() || !!pageDialog(), performance.now());
     const st = s.status?.read();                  // null while the game writes it: the last state stands
     if (!st || !st.has('photo')) return;
     const bits = st.get('photo')!;
+    this.fpv.status(bits);
     this.can = (bits & 1) !== 0;
     if (((bits & 2) !== 0) !== this.on) this.show((bits & 2) !== 0);
     if (!this.on) return;
@@ -610,6 +619,11 @@ export class PhotoMode {
 
   // ---- the keyboard, the mouse and the touch screen while photo mode is on ---------------------------------------
   private onKey(e: KeyboardEvent, down: boolean) {
+    if (this.fpv.key(e, down, !!pageDialog()) && !pageKey(e.code)){
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      return;
+    }
     const bit = HELD[e.code];
     if (!down && bit && this.keys & bit) { this.keys &= ~bit; this.steer(); }   // let go wherever it went (a dialog, Ctrl)
     if (!this.on || pageKey(e.code) || pageDialog()) return;

@@ -2679,6 +2679,10 @@ export async function boot() {
   window.addEventListener('keydown', e => {
     // (the keys the player gave them: sitekeys.ts; F12 not photo mode's stays away from the game all the same, whose own
     // screenshot comes out black, and goes to the browser)
+    if (session && e.code === 'F8' && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && photo.toggleFpv()){
+      e.preventDefault(); e.stopImmediatePropagation();
+      return;
+    }
     const ours = session ? menuKeyOf(e.code) : null;
     if (ours) {
       e.preventDefault(); e.stopImmediatePropagation();
